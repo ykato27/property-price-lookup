@@ -24,10 +24,18 @@ CREATE TABLE IF NOT EXISTS properties (
     direction TEXT,
     management_fee INTEGER,
     repair_reserve_fund INTEGER,
+    image_urls TEXT,
+    local_image_paths TEXT,
     scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
+
+# 既存テーブルへのカラム追加SQL（マイグレーション用）
+ALTER_TABLE_ADD_IMAGES = [
+    "ALTER TABLE properties ADD COLUMN image_urls TEXT;",
+    "ALTER TABLE properties ADD COLUMN local_image_paths TEXT;",
+]
 
 # predictionsテーブル作成SQL
 CREATE_PREDICTIONS_TABLE = """

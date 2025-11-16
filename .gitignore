@@ -43,6 +43,9 @@ data/*.db
 data/models/*.pkl
 data/models/*.json
 
+# Images
+data/images/
+
 # Logs
 *.log
 

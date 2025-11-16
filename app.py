@@ -6,6 +6,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
+import json
+from PIL import Image
 
 from config.settings import (
     TARGET_PREFECTURES,
@@ -14,7 +16,10 @@ from config.settings import (
     MODEL_METADATA_PATH,
 )
 from src.database.db_manager import DatabaseManager
-from src.scraper.suumo_scraper import generate_dummy_properties
+from src.scraper.suumo_scraper import generate_dummy_properties, SuumoScraper
+from src.scraper.athome_scraper import AthomeScraper
+from src.scraper.homes_scraper import HomesScraper
+from src.scraper.rakuten_scraper import RakutenScraper
 from src.ml.model_trainer import ModelTrainer
 from src.ml.predictor import PricePredictor
 from src.utils.helpers import (
@@ -149,7 +154,26 @@ def show_bargain_properties(
             # 物件カード表示
             for idx, row in bargain_df.iterrows():
                 with st.container():
-                    col1, col2, col3 = st.columns([2, 2, 1])
+                    # 画像を表示する場合は4列に変更
+                    has_images = row.get('local_image_paths') and row.get('local_image_paths') != 'null'
+
+                    if has_images:
+                        img_col, col1, col2, col3 = st.columns([1, 2, 2, 1])
+
+                        # 画像表示
+                        with img_col:
+                            try:
+                                image_paths = json.loads(row['local_image_paths'])
+                                if image_paths and len(image_paths) > 0:
+                                    # 最初の画像を表示
+                                    img_path = Path(image_paths[0])
+                                    if img_path.exists():
+                                        image = Image.open(img_path)
+                                        st.image(image, use_column_width=True)
+                            except Exception:
+                                st.write("🏠")
+                    else:
+                        col1, col2, col3 = st.columns([2, 2, 1])
 
                     with col1:
                         st.subheader(f"{row['prefecture']} {row['city']}")
@@ -208,27 +232,71 @@ def show_data_acquisition():
     """データ取得画面を表示"""
     st.header("📥 データ取得")
 
-    st.info(
-        "⚠️ 注意: 実際のスクレイピングは各サイトの利用規約を確認してから実行してください。\n"
-        "このデモではダミーデータを生成します。"
+    # スクレイピングモード選択
+    scrape_mode = st.radio(
+        "データ取得モード",
+        options=["ダミーデータ", "実際のスクレイピング"],
+        help="ダミーデータ: テスト用のランダムデータを生成\n実際のスクレイピング: 各サイトから実際のデータを取得",
     )
 
-    col1, col2 = st.columns(2)
+    if scrape_mode == "実際のスクレイピング":
+        st.warning(
+            "⚠️ 実際のスクレイピングを実行します。\n"
+            "各サイトの利用規約を確認してから実行してください。\n"
+            "過度なアクセスはサーバーに負荷をかけるため、適切な間隔を空けてください。"
+        )
+
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         # 都道府県選択
         prefecture = st.selectbox("都道府県", TARGET_PREFECTURES)
 
     with col2:
-        # 取得件数
-        data_count = st.number_input("取得件数", min_value=10, max_value=1000, value=100, step=10)
+        if scrape_mode == "ダミーデータ":
+            # 取得件数
+            data_count = st.number_input("取得件数", min_value=10, max_value=1000, value=100, step=10)
+        else:
+            # ページ数
+            max_pages = st.number_input("最大ページ数", min_value=1, max_value=10, value=2, step=1)
+
+    with col3:
+        if scrape_mode == "実際のスクレイピング":
+            # サイト選択
+            site_name = st.selectbox(
+                "取得元サイト",
+                options=list(SUPPORTED_SITES.keys()),
+            )
 
     # データ取得ボタン
-    if st.button("🚀 ダミーデータ取得開始", type="primary"):
+    button_label = "🚀 ダミーデータ取得開始" if scrape_mode == "ダミーデータ" else "🚀 スクレイピング開始"
+
+    if st.button(button_label, type="primary"):
         with st.spinner("データ取得中..."):
             try:
-                # ダミーデータ生成
-                properties = generate_dummy_properties(count=data_count)
+                if scrape_mode == "ダミーデータ":
+                    # ダミーデータ生成
+                    properties = generate_dummy_properties(count=data_count)
+                    source_site = "SUUMO(ダミー)"
+                else:
+                    # 実際のスクレイピング
+                    scrapers = {
+                        "SUUMO": SuumoScraper(),
+                        "athome": AthomeScraper(),
+                        "HOMES": HomesScraper(),
+                        "楽天不動産": RakutenScraper(),
+                    }
+
+                    scraper = scrapers.get(site_name)
+                    if not scraper:
+                        st.error(f"サイト {site_name} のスクレイパーが見つかりません")
+                        return
+
+                    properties = scraper.scrape_properties(
+                        prefecture=prefecture,
+                        max_pages=max_pages
+                    )
+                    source_site = site_name
 
                 # データベースに保存
                 with DatabaseManager() as db:
@@ -236,7 +304,7 @@ def show_data_acquisition():
 
                     # ログ記録
                     log_data = {
-                        "source_site": "SUUMO",
+                        "source_site": source_site,
                         "prefecture": prefecture,
                         "records_count": success_count,
                         "success": True,
@@ -246,23 +314,28 @@ def show_data_acquisition():
 
                 st.success(f"✅ {success_count} 件のデータを取得しました！")
 
-                # 取得データのサマリ表示
-                df = pd.DataFrame(properties)
-                st.subheader("取得データサマリ")
+                if properties:
+                    # 取得データのサマリ表示
+                    df = pd.DataFrame(properties)
+                    st.subheader("取得データサマリ")
 
-                summary_col1, summary_col2, summary_col3 = st.columns(3)
+                    summary_col1, summary_col2, summary_col3 = st.columns(3)
 
-                with summary_col1:
-                    st.metric("平均価格", format_price(df["price"].mean()))
+                    with summary_col1:
+                        st.metric("平均価格", format_price(df["price"].mean()))
 
-                with summary_col2:
-                    st.metric("平均専有面積", format_area(df["floor_area"].mean()))
+                    with summary_col2:
+                        if "floor_area" in df.columns:
+                            st.metric("平均専有面積", format_area(df["floor_area"].mean()))
 
-                with summary_col3:
-                    st.metric("平均築年数", format_age(df["building_age"].mean()))
+                    with summary_col3:
+                        if "building_age" in df.columns:
+                            st.metric("平均築年数", format_age(df["building_age"].mean()))
 
             except Exception as e:
                 st.error(f"❌ エラーが発生しました: {e}")
+                import traceback
+                st.code(traceback.format_exc())
 
     # 取得履歴表示
     st.subheader("📜 取得履歴")

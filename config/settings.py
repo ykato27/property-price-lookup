@@ -10,6 +10,7 @@ BASE_DIR = Path(__file__).parent.parent
 # データディレクトリ
 DATA_DIR = BASE_DIR / "data"
 MODEL_DIR = DATA_DIR / "models"
+IMAGE_DIR = DATA_DIR / "images"
 
 # データベースパス
 DB_PATH = DATA_DIR / "properties.db"
@@ -50,3 +51,4 @@ DATA_RETENTION_DAYS = 365
 # ディレクトリ作成
 DATA_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
+IMAGE_DIR.mkdir(exist_ok=True)
