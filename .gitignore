@@ -36,6 +36,9 @@ ENV/
 # Database
 data/properties.db
 data/*.db
+
+# 不動産情報ライブラリから取得した生データ（再取得可能・容量が大きい）
+data/raw/
 *.sqlite
 *.sqlite3
 

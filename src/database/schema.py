@@ -44,6 +44,39 @@ CREATE TABLE IF NOT EXISTS predictions (
 );
 """
 
+# transactionsテーブル作成SQL
+# 国土交通省「不動産情報ライブラリ」の取引価格情報・成約価格情報の成約事例。
+# 募集物件（properties）とは物差しが違うため別テーブルに分ける。
+# 公開データにはマンション名・所在階・総戸数・管理費等は含まれない。
+CREATE_TRANSACTIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    price_category TEXT,
+    type TEXT,
+    region TEXT,
+    municipality_code TEXT NOT NULL,
+    prefecture TEXT NOT NULL,
+    municipality TEXT NOT NULL,
+    district_name TEXT,
+    nearest_station TEXT,
+    station_distance_min REAL,
+    trade_price INTEGER NOT NULL,
+    floor_plan TEXT,
+    area REAL NOT NULL,
+    unit_price REAL,
+    building_year INTEGER,
+    structure TEXT,
+    city_planning TEXT,
+    renovation TEXT,
+    remarks TEXT,
+    period_year INTEGER NOT NULL,
+    period_quarter INTEGER NOT NULL,
+    record_hash TEXT UNIQUE NOT NULL,
+    imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 # scraping_logsテーブル作成SQL
 CREATE_SCRAPING_LOGS_TABLE = """
 CREATE TABLE IF NOT EXISTS scraping_logs (
@@ -66,6 +99,9 @@ CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_source_site ON properties(source_site);",
     "CREATE INDEX IF NOT EXISTS idx_discount_rate ON predictions(discount_rate);",
     "CREATE INDEX IF NOT EXISTS idx_predicted_at ON predictions(predicted_at);",
+    "CREATE INDEX IF NOT EXISTS idx_tx_municipality ON transactions(municipality_code);",
+    "CREATE INDEX IF NOT EXISTS idx_tx_period ON transactions(period_year, period_quarter);",
+    "CREATE INDEX IF NOT EXISTS idx_tx_prefecture ON transactions(prefecture);",
 ]
 
 # すべてのテーブル作成SQL
@@ -73,4 +109,30 @@ ALL_TABLES = [
     CREATE_PROPERTIES_TABLE,
     CREATE_PREDICTIONS_TABLE,
     CREATE_SCRAPING_LOGS_TABLE,
+    CREATE_TRANSACTIONS_TABLE,
 ]
+
+# 既存DB向けの追加カラム（マイグレーション）
+# properties: listing（募集物件）としての必須・任意項目を追加する。
+PROPERTY_ADDITIONAL_COLUMNS = {
+    "building_year": "INTEGER",
+    "rights_type": "TEXT",
+    "is_tenanted": "INTEGER DEFAULT 0",
+    "monthly_rent": "INTEGER",
+    "total_units": "INTEGER",
+    "listing_date": "TEXT",
+}
+
+# predictions: 「最新予測のみ有効」の運用と、新しい評価（理論価格・区間・ゲート等）。
+PREDICTION_ADDITIONAL_COLUMNS = {
+    "is_latest": "INTEGER DEFAULT 1",
+    "theoretical_price": "INTEGER",
+    "conservative_price": "INTEGER",
+    "interval_low": "INTEGER",
+    "interval_high": "INTEGER",
+    "similar_count": "INTEGER",
+    "confidence": "TEXT",
+    "risk_flags": "TEXT",
+    "gate_passed": "INTEGER",
+    "score": "REAL",
+}

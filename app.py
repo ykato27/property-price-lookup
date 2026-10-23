@@ -1,446 +1,391 @@
 """
-不動産割安物件発見システム - Streamlitアプリ
+割安マンション検出＋投資判断支援アプリ
+
+設計の要点（docs/DESIGN.md 参照）:
+- 理論価格は国交省「不動産情報ライブラリ」の成約/取引データから作る
+  （ポータルサイトのスクレイピングを中核に置かない）。
+- 募集物件（listing）は CSV 投入＋手入力で取り込む。取得日・出所が必須。
+- 「割安候補」はゲート条件（類似成約 n>=10、直近2年以内の事例、保守値への
+  乖離15%以上、ハードフィルタ非抵触）を満たしたものだけ。
+- 本アプリの出力は購入推奨ではなく、精査の優先順位付けである。
 """
-import streamlit as st
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+import json
+import tempfile
 from pathlib import Path
 
+import pandas as pd
+import streamlit as st
+
 from config.settings import (
-    TARGET_PREFECTURES,
-    SUPPORTED_SITES,
-    LATEST_MODEL_PATH,
-    MODEL_METADATA_PATH,
+    PRICE_MODEL_METADATA_PATH,
+    PRICE_MODEL_PATH,
+    get_reinfolib_api_key,
 )
 from src.database.db_manager import DatabaseManager
-from src.scraper.suumo_scraper import generate_dummy_properties
-from src.ml.model_trainer import ModelTrainer
-from src.ml.predictor import PricePredictor
-from src.utils.helpers import (
-    format_price,
-    format_area,
-    format_age,
-    format_station_distance,
-    get_discount_color,
+from src.market.checklist import build_checklist_markdown
+from src.market.importer import import_file, import_records
+from src.market.investment import analyze_investment
+from src.market.listings import import_listings, import_listings_csv
+from src.market.price_model import PriceModel, train_price_model
+from src.market.reinfolib_client import ReinfolibAuthError, ReinfolibClient
+from src.market.scoring import RiskFlag, Valuation, valuate_all_properties
+
+st.set_page_config(page_title="割安マンション検出", page_icon="🏢", layout="wide")
+
+DISCLAIMER = (
+    "⚠️ 本システムの出力は**購入推奨ではありません**。成約データに基づく理論価格との"
+    "比較による「精査の優先順位付け」です。理論価格にはモデル誤差（期間分割評価で "
+    "MAPE 約10%前後）があり、割安に見える物件の相当部分は旧耐震・積立不足・借地権などの"
+    "リスクの裏返しです。購入判断は重要事項調査報告書・長期修繕計画・総会議事録などの"
+    "一次資料を確認した上で行ってください。"
 )
 
-# ページ設定
-st.set_page_config(
-    page_title="不動産割安物件発見システム",
-    page_icon="🏠",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
-# 日本語フォント設定（matplotlib）
-plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
-sns.set_style("whitegrid")
+@st.cache_resource
+def get_db() -> DatabaseManager:
+    db = DatabaseManager()
+    db.connect()
+    db.initialize_database()
+    return db
 
 
-def initialize_database():
-    """データベースを初期化"""
-    with DatabaseManager() as db:
-        db.initialize_database()
+def load_price_model():
+    if PRICE_MODEL_PATH.exists():
+        try:
+            return PriceModel.load(PRICE_MODEL_PATH)
+        except Exception:
+            return None
+    return None
+
+
+def format_yen(value) -> str:
+    try:
+        return f"{int(value):,} 円"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def main():
-    """メイン関数"""
-    # データベース初期化
-    initialize_database()
+    st.title("🏢 割安マンション検出＋投資判断支援")
+    st.info(DISCLAIMER)
 
-    # タイトル
-    st.title("🏠 不動産割安物件発見システム")
-    st.markdown("機械学習で市場価格より安い物件を見つけます")
+    db = get_db()
 
-    # サイドバー: 検索条件
+    # サイドバー: データの状態
     with st.sidebar:
-        st.header("🔍 検索条件")
+        st.header("データの状態")
+        tx_count = db.get_transaction_count()
+        props = db.get_properties(limit=100000)
+        st.metric("成約データ（理論価格の土台）", f"{tx_count:,} 件")
+        st.metric("募集物件（listing）", f"{len(props):,} 件")
+        if tx_count == 0:
+            st.warning(
+                "成約データがまだありません。「データ取込」タブから不動産情報ライブラリの"
+                "データを投入してください（APIキーの申請手順は docs/DATA_SOURCES.md）。"
+            )
+        key = get_reinfolib_api_key()
+        st.write("不動産情報ライブラリ APIキー: " + ("設定済み ✅" if key else "未設定"))
+        st.write("価格モデル（第2層）: " + ("学習済み ✅" if PRICE_MODEL_PATH.exists() else "未学習（第1層のみで評価）"))
 
-        # 都道府県選択
-        selected_prefectures = st.multiselect(
-            "都道府県",
-            options=TARGET_PREFECTURES,
-            default=TARGET_PREFECTURES,
-        )
-
-        # 割引率設定
-        min_discount_rate = st.slider(
-            "最低割引率 (%)",
-            min_value=5,
-            max_value=50,
-            value=20,
-            step=5,
-        )
-
-        # 最低価格設定
-        min_price = st.slider(
-            "最低価格 (万円)",
-            min_value=1000,
-            max_value=10000,
-            value=3000,
-            step=500,
-        )
-
-        # 最大表示件数
-        max_display = st.selectbox(
-            "最大表示件数",
-            options=[10, 50, 100],
-            index=1,
-        )
-
-    # タブ作成
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📋 割安物件一覧", "📥 データ取得", "🤖 モデル学習", "📊 統計情報"]
+    tab_candidates, tab_import, tab_model, tab_stats = st.tabs(
+        ["🎯 割安候補", "📥 データ取込", "🧮 理論価格モデル", "📊 統計・設定"]
     )
 
-    # タブ1: 割安物件一覧
-    with tab1:
-        show_bargain_properties(
-            selected_prefectures, min_discount_rate, min_price, max_display
+    # ================= 割安候補 =================
+    with tab_candidates:
+        st.header("割安候補（ゲート条件を満たした物件のみ）")
+        st.caption(
+            "ゲート条件: 類似成約 n≥10 / 直近2年以内の事例あり / 保守値（25%点）への乖離≥15% / "
+            "予測区間幅≤1.6 / ハードフィルタ（旧耐震の近似判定・定期借地権）非抵触。"
+            "信頼度は n・区間幅・事例の新しさから付けています。"
         )
+        if st.button("🔄 全 listing を再評価する", key="valuate_btn"):
+            model = load_price_model()
+            with st.spinner("理論価格を計算しています..."):
+                results = valuate_all_properties(db, model=model)
+            passed = sum(1 for v in results if v.gate_passed)
+            st.success(f"{len(results)} 件を評価しました。割安候補は {passed} 件です。")
 
-    # タブ2: データ取得
-    with tab2:
-        show_data_acquisition()
-
-    # タブ3: モデル学習
-    with tab3:
-        show_model_training()
-
-    # タブ4: 統計情報
-    with tab4:
-        show_statistics()
-
-
-def show_bargain_properties(
-    selected_prefectures, min_discount_rate, min_price, max_display
-):
-    """割安物件一覧を表示"""
-    st.header("📋 割安物件一覧")
-
-    # モデルが存在するかチェック
-    if not LATEST_MODEL_PATH.exists():
-        st.warning("⚠️ 学習済みモデルが見つかりません。先に「モデル学習」タブでモデルを学習してください。")
-        return
-
-    with DatabaseManager() as db:
-        # 割安物件を取得
-        try:
-            bargain_df = db.get_bargain_properties(
-                min_discount_rate=min_discount_rate, limit=max_display
-            )
-
-            if len(bargain_df) == 0:
-                st.info("条件に一致する割安物件が見つかりませんでした。")
-                return
-
-            # 都道府県でフィルタ
-            if selected_prefectures:
-                bargain_df = bargain_df[
-                    bargain_df["prefecture"].isin(selected_prefectures)
-                ]
-
-            # 最低価格でフィルタ
-            bargain_df = bargain_df[bargain_df["price"] >= min_price * 10000]
-
-            st.success(f"🎯 {len(bargain_df)} 件の割安物件が見つかりました！")
-
-            # 物件カード表示
-            for idx, row in bargain_df.iterrows():
-                with st.container():
-                    col1, col2, col3 = st.columns([2, 2, 1])
-
-                    with col1:
-                        st.subheader(f"{row['prefecture']} {row['city']}")
-                        st.write(f"**住所:** {row.get('address', '不明')}")
-                        st.write(f"**間取り:** {row.get('layout', '不明')}")
-                        st.write(
-                            f"**駅:** {row.get('nearest_station', '不明')} {format_station_distance(row.get('station_distance'))}"
-                        )
-
-                    with col2:
-                        st.metric(
-                            "販売価格",
-                            format_price(row["price"]),
-                        )
-                        st.metric(
-                            "予測価格",
-                            format_price(row["predicted_price"]),
-                        )
-
-                    with col3:
-                        discount_color = get_discount_color(row["discount_rate"])
-                        st.markdown(
-                            f"<h2 style='color: {discount_color}; text-align: center;'>{row['discount_rate']:.1f}%</h2>",
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(
-                            "<p style='text-align: center;'>割引率</p>",
-                            unsafe_allow_html=True,
-                        )
-
-                    # 詳細情報
-                    with st.expander("詳細情報"):
-                        detail_col1, detail_col2 = st.columns(2)
-
-                        with detail_col1:
-                            st.write(f"**専有面積:** {format_area(row.get('floor_area'))}")
-                            st.write(f"**築年数:** {format_age(row.get('building_age'))}")
-                            st.write(f"**階数:** {row.get('floor_number', '不明')}階 / {row.get('total_floors', '不明')}階建")
-                            st.write(f"**構造:** {row.get('structure', '不明')}")
-
-                        with detail_col2:
-                            st.write(f"**向き:** {row.get('direction', '不明')}")
-                            st.write(f"**管理費:** {format_price(row.get('management_fee', 0))}/月")
-                            st.write(f"**修繕積立金:** {format_price(row.get('repair_reserve_fund', 0))}/月")
-                            st.write(f"**取得元:** {row.get('source_site', '不明')}")
-
-                        st.write(f"**URL:** {row.get('url', 'なし')}")
-
-                    st.divider()
-
-        except Exception as e:
-            st.error(f"エラーが発生しました: {e}")
-
-
-def show_data_acquisition():
-    """データ取得画面を表示"""
-    st.header("📥 データ取得")
-
-    st.info(
-        "⚠️ 注意: 実際のスクレイピングは各サイトの利用規約を確認してから実行してください。\n"
-        "このデモではダミーデータを生成します。"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        # 都道府県選択
-        prefecture = st.selectbox("都道府県", TARGET_PREFECTURES)
-
-    with col2:
-        # 取得件数
-        data_count = st.number_input("取得件数", min_value=10, max_value=1000, value=100, step=10)
-
-    # データ取得ボタン
-    if st.button("🚀 ダミーデータ取得開始", type="primary"):
-        with st.spinner("データ取得中..."):
-            try:
-                # ダミーデータ生成
-                properties = generate_dummy_properties(count=data_count)
-
-                # データベースに保存
-                with DatabaseManager() as db:
-                    success_count = db.bulk_insert_properties(properties)
-
-                    # ログ記録
-                    log_data = {
-                        "source_site": "SUUMO",
-                        "prefecture": prefecture,
-                        "records_count": success_count,
-                        "success": True,
-                        "error_message": None,
-                    }
-                    db.insert_scraping_log(log_data)
-
-                st.success(f"✅ {success_count} 件のデータを取得しました！")
-
-                # 取得データのサマリ表示
-                df = pd.DataFrame(properties)
-                st.subheader("取得データサマリ")
-
-                summary_col1, summary_col2, summary_col3 = st.columns(3)
-
-                with summary_col1:
-                    st.metric("平均価格", format_price(df["price"].mean()))
-
-                with summary_col2:
-                    st.metric("平均専有面積", format_area(df["floor_area"].mean()))
-
-                with summary_col3:
-                    st.metric("平均築年数", format_age(df["building_age"].mean()))
-
-            except Exception as e:
-                st.error(f"❌ エラーが発生しました: {e}")
-
-    # 取得履歴表示
-    st.subheader("📜 取得履歴")
-    with DatabaseManager() as db:
-        logs_df = db.get_scraping_logs(limit=20)
-
-        if len(logs_df) > 0:
-            st.dataframe(
-                logs_df[
-                    ["executed_at", "source_site", "prefecture", "records_count", "success"]
-                ],
-                use_container_width=True,
-            )
+        latest = db.get_latest_valuations()
+        if latest.empty:
+            st.info("まだ評価が実行されていません。「全 listing を再評価する」を押してください。")
         else:
-            st.info("まだデータ取得履歴がありません")
+            prop_map = {row["property_id"]: row for _, row in props.iterrows()}
 
-
-def show_model_training():
-    """モデル学習画面を表示"""
-    st.header("🤖 モデル学習")
-
-    # データ件数確認
-    with DatabaseManager() as db:
-        property_count = db.get_property_count()
-
-    st.info(f"現在のデータ件数: **{property_count}** 件")
-
-    if property_count < 100:
-        st.warning("⚠️ データが不足しています。最低100件のデータが必要です。")
-        return
-
-    # 学習実行ボタン
-    if st.button("🚀 学習開始", type="primary"):
-        with st.spinner("モデル学習中..."):
-            try:
-                # データ取得
-                with DatabaseManager() as db:
-                    df = db.get_all_properties_for_training()
-
-                st.write(f"学習データ: {len(df)} 件")
-
-                # モデル学習
-                trainer = ModelTrainer()
-                progress_bar = st.progress(0)
-
-                progress_bar.progress(30)
-                metrics = trainer.train(df, remove_outliers_flag=True)
-
-                progress_bar.progress(70)
-                trainer.save_model()
-
-                progress_bar.progress(100)
-
-                st.success("✅ モデル学習完了！")
-
-                # 評価指標表示
-                st.subheader("📈 評価指標")
-
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-
-                with metric_col1:
-                    st.metric("RMSE (検証)", f"{metrics['val_rmse']:,.0f}")
-
-                with metric_col2:
-                    st.metric("MAE (検証)", f"{metrics['val_mae']:,.0f}")
-
-                with metric_col3:
-                    st.metric("R² (検証)", f"{metrics['val_r2']:.4f}")
-
-                # 特徴量重要度
-                st.subheader("🔍 特徴量重要度 (Top 10)")
-                fig, ax = plt.subplots(figsize=(10, 6))
-                top_features = trainer.feature_importance.head(10)
-                ax.barh(top_features["feature"], top_features["importance"])
-                ax.set_xlabel("Importance")
-                ax.set_title("Feature Importance")
-                st.pyplot(fig)
-
-                # 予測実行
-                st.subheader("🎯 予測実行")
-                if st.button("全物件の価格を予測"):
-                    predictor = PricePredictor()
-                    predictor.load_model()
-
-                    predictions_df = predictor.predict(df)
-                    prediction_records = predictor.create_prediction_records(
-                        predictions_df
+            def valuation_table(df: pd.DataFrame) -> pd.DataFrame:
+                rows = []
+                for _, v in df.iterrows():
+                    p = prop_map.get(v["property_id"])
+                    if p is None:
+                        continue
+                    rows.append(
+                        {
+                            "所在地": f"{p['prefecture']} {p['city']}",
+                            "募集価格": format_yen(p["price"]),
+                            "理論価格（中央値）": format_yen(v["theoretical_price"]),
+                            "保守値（25%点）": format_yen(v["conservative_price"]),
+                            "予測区間": f"{format_yen(v['interval_low'])} 〜 {format_yen(v['interval_high'])}",
+                            "割安スコア": f"{v['score']:.1%}" if pd.notna(v["score"]) else "-",
+                            "類似成約n": int(v["similar_count"]),
+                            "信頼度": v["confidence"],
+                            "フラグ数": len(json.loads(v["risk_flags"] or "[]")),
+                        }
                     )
+                return pd.DataFrame(rows)
 
-                    # 予測結果をデータベースに保存
-                    with DatabaseManager() as db:
-                        success_count = db.bulk_insert_predictions(prediction_records)
+            candidates = latest[latest["gate_passed"] == 1]
+            if candidates.empty:
+                st.info("現在、ゲート条件を満たす割安候補はありません。")
+            else:
+                st.dataframe(valuation_table(candidates), width="stretch", hide_index=True)
+                st.subheader("候補の詳細と精査チェックリスト")
+                for _, v in candidates.iterrows():
+                    p = prop_map.get(v["property_id"])
+                    if p is None:
+                        continue
+                    title = f"{p['prefecture']} {p['city']} — {format_yen(p['price'])}（スコア {v['score']:.1%}）"
+                    with st.expander(title):
+                        show_property_detail(p, v)
 
-                    st.success(f"✅ {success_count} 件の予測を保存しました！")
+            st.subheader("全物件の評価（候補外を含む）")
+            st.dataframe(valuation_table(latest), width="stretch", hide_index=True)
 
-            except Exception as e:
-                st.error(f"❌ エラーが発生しました: {e}")
-                import traceback
+    # ================= データ取込 =================
+    with tab_import:
+        st.header("成約データの取込（理論価格の土台）")
+        st.write(
+            "国土交通省「不動産情報ライブラリ」の取引価格・成約価格データを取り込みます。"
+            "APIキーの申請手順とデータ仕様は docs/DATA_SOURCES.md を参照してください。"
+        )
+        uploaded = st.file_uploader(
+            "公式サイトからダウンロードしたファイル（JSON / CSV）",
+            type=["json", "csv"],
+            key="tx_upload",
+        )
+        if uploaded is not None and st.button("成約ファイルを取り込む"):
+            suffix = Path(uploaded.name).suffix
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(uploaded.getbuffer())
+                tmp_path = tmp.name
+            result = import_file(db, tmp_path)
+            st.success(f"取り込み結果: {result}（成約データ総件数: {db.get_transaction_count():,}）")
 
-                st.code(traceback.format_exc())
+        with st.expander("APIから直接取得する（REINFOLIB_API_KEY が必要）"):
+            if not get_reinfolib_api_key():
+                st.warning(
+                    "APIキーが未設定です。https://www.reinfolib.mlit.go.jp/api/request/ から"
+                    "利用申請を行い、発行されたキーを環境変数 REINFOLIB_API_KEY に設定してください。"
+                )
+            col1, col2, col3 = st.columns(3)
+            year = col1.number_input("年", min_value=2005, max_value=2030, value=2024)
+            quarter = col2.selectbox("四半期", [1, 2, 3, 4], index=0)
+            area = col3.text_input("都道府県コード（例: 13=東京都）", value="13")
+            if st.button("APIから取得して取り込む", disabled=not get_reinfolib_api_key()):
+                try:
+                    client = ReinfolibClient()
+                    records = client.fetch_transactions(year=int(year), quarter=int(quarter), area=area or None)
+                    result = import_records(db, records)
+                    st.success(f"取り込み結果: {result}（総件数: {db.get_transaction_count():,}）")
+                except ReinfolibAuthError as e:
+                    st.error(str(e))
 
-    # モデル情報表示
-    st.subheader("ℹ️ モデル情報")
-    metadata = ModelTrainer.load_metadata()
+        st.divider()
+        st.header("募集物件（listing）の投入")
+        st.write(
+            "ポータルサイトのスクレイピングは行いません。手元で入手した募集情報を "
+            "CSV またはフォームで投入してください。**取得日と出所は必須**です"
+            "（古い listing は陳腐化するため）。"
+        )
+        listing_csv = st.file_uploader("listing CSV（日本語ヘッダ可）", type=["csv"], key="listing_upload")
+        if listing_csv is not None and st.button("listing CSVを取り込む"):
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+                tmp.write(listing_csv.getbuffer())
+                tmp_path = tmp.name
+            success, errors = import_listings_csv(db, tmp_path)
+            st.success(f"{success} 件を取り込みました")
+            for e in errors:
+                st.error(e)
 
-    if metadata:
-        st.write(f"**学習日時:** {metadata.get('trained_at', '不明')}")
-        st.write(f"**モデル種別:** {metadata.get('model_type', '不明')}")
+        with st.form("listing_form"):
+            st.subheader("手入力フォーム")
+            c1, c2, c3 = st.columns(3)
+            price = c1.number_input("募集価格（円）*", min_value=0, step=100_000)
+            prefecture = c2.text_input("都道府県*", value="東京都")
+            city = c3.text_input("市区町村*", value="")
+            c4, c5, c6 = st.columns(3)
+            floor_area = c4.number_input("専有面積（㎡）*", min_value=0.0, step=1.0)
+            building_year = c5.number_input("建築年（西暦）", min_value=0, max_value=2100, value=0)
+            layout = c6.text_input("間取り", value="")
+            c7, c8, c9 = st.columns(3)
+            station = c7.text_input("最寄駅", value="")
+            station_min = c8.number_input("駅徒歩（分）", min_value=0, value=0)
+            total_units = c9.number_input("総戸数", min_value=0, value=0)
+            c10, c11, c12 = st.columns(3)
+            mgmt_fee = c10.number_input("管理費（円/月）", min_value=0, value=0)
+            reserve = c11.number_input("修繕積立金（円/月）", min_value=0, value=0)
+            monthly_rent = c12.number_input("月額賃料（円、賃貸中・根拠が確かな場合のみ）", min_value=0, value=0)
+            c13, c14 = st.columns(2)
+            rights_type = c13.selectbox("権利形態", ["所有権", "所有権（借地権付）", "定期借地権", "普通借地権", "不明"])
+            is_tenanted = c14.checkbox("賃貸中（オーナーチェンジ）")
+            c15, c16 = st.columns(2)
+            listing_date = c15.date_input("取得日*")
+            source_site = c16.text_input("出所*（例: 掲載サイト名、不動産会社名）", value="")
+            submitted = st.form_submit_button("listing を登録する")
+            if submitted:
+                row = {
+                    "price": price or None,
+                    "prefecture": prefecture,
+                    "city": city,
+                    "floor_area": floor_area or None,
+                    "building_year": building_year or None,
+                    "layout": layout or None,
+                    "nearest_station": station or None,
+                    "station_distance": station_min or None,
+                    "total_units": total_units or None,
+                    "management_fee": mgmt_fee or None,
+                    "repair_reserve_fund": reserve or None,
+                    "monthly_rent": monthly_rent or None,
+                    "rights_type": rights_type,
+                    "is_tenanted": 1 if is_tenanted else 0,
+                    "listing_date": listing_date.isoformat(),
+                    "source_site": source_site,
+                }
+                success, errors = import_listings(db, [row])
+                if success:
+                    st.success("登録しました。「割安候補」タブで再評価してください。")
+                for e in errors:
+                    st.error(e)
 
-        if "metrics" in metadata:
-            st.json(metadata["metrics"])
+        with st.expander("🧪 テスト用ダミーデータ（通常フローでは使いません）"):
+            st.caption(
+                "旧バージョン互換のダミー生成です。生成される価格は乱数のため、"
+                "割安判定の根拠にはなりません。動作確認にのみ使ってください。"
+            )
+            if st.button("ダミー物件を10件生成する"):
+                from src.scraper.suumo_scraper import SuumoScraper
+
+                scraper = SuumoScraper(db)
+                dummy = scraper.generate_dummy_properties(10)
+                saved = scraper.save_properties(dummy)
+                st.success(f"ダミー物件を {saved} 件保存しました（出所: dummy）")
+
+    # ================= 理論価格モデル =================
+    with tab_model:
+        st.header("理論価格モデル（2層）")
+        st.markdown(
+            """
+            - **第1層（類似成約）**: 同一市区町村×築年帯×面積帯の成約プールから、
+              時点補正後の中央値・25%点・75%点を取る。事例数 n を必ず併記。
+            - **第2層（ML）**: LightGBM で log(㎡単価) の分位点回帰（25%/中央値/75%）を行い予測区間を出す。
+            - 評価は**期間分割**（古い期間で学習→新しい期間で検証）で MAPE と区間被覆率を測る。
+              ランダム分割は同一地区の将来情報が学習に混入するため使わない。
+            """
+        )
+        if PRICE_MODEL_METADATA_PATH.exists():
+            meta = json.loads(PRICE_MODEL_METADATA_PATH.read_text(encoding="utf-8"))
+            m = meta.get("metrics") or {}
+            st.subheader("現在のモデルの期間分割評価（学習時の実測）")
+            if m:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("MAPE", f"{m.get('mape_percent', 0):.1f} %")
+                c2.metric("50%区間の被覆率", f"{m.get('coverage_50_percent', 0):.1f} %（理想 50%）")
+                c3.metric("学習件数", f"{meta.get('trained_rows', 0):,} 件")
+                st.caption(
+                    "被覆率が50%を大きく下回る場合、予測区間は過信気味であることを意味します。"
+                )
+        if st.button("価格モデルを学習する（成約データから）"):
+            tx = db.get_transactions()
+            if len(tx) < 200:
+                st.error(f"学習には最低200件の成約データが必要です（現在 {len(tx)} 件）。")
+            else:
+                with st.spinner("学習と期間分割評価を実行しています..."):
+                    model, metrics = train_price_model(tx)
+                    model.save(metrics=metrics)
+                st.success(
+                    f"学習完了: MAPE {metrics['mape_percent']:.1f}%、"
+                    f"50%区間被覆率 {metrics['coverage_50_percent']:.1f}%"
+                )
+                st.json(metrics)
+
+    # ================= 統計・設定 =================
+    with tab_stats:
+        st.header("統計")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("成約データ", f"{db.get_transaction_count():,} 件")
+        c2.metric("募集物件", f"{len(props):,} 件")
+        latest_stats = db.get_latest_valuations()
+        c3.metric(
+            "割安候補（最新評価）",
+            f"{int((latest_stats['gate_passed'] == 1).sum()) if not latest_stats.empty else 0} 件",
+        )
+        if not props.empty:
+            st.subheader("市区町村別の listing 件数")
+            st.bar_chart(props.groupby("city").size().sort_values(ascending=False).head(20))
+        st.subheader("データソースについて")
+        st.write(
+            "- 成約/取引データ: 国土交通省「不動産情報ライブラリ」（APIキー申請制）。詳細は docs/DATA_SOURCES.md\n"
+            "- 募集物件: 利用者が CSV / 手入力で投入したもの（スクレイピングは行わない）\n"
+            "- 設計判断の根拠: docs/DESIGN.md"
+        )
+
+
+def show_property_detail(p: pd.Series, v: pd.Series):
+    """割安候補1件の詳細（フラグ・投資指標・チェックリスト）。"""
+    flags = json.loads(v["risk_flags"] or "[]")
+    st.write(f"**理論価格レンジ**: {format_yen(v['interval_low'])} 〜 {format_yen(v['interval_high'])}")
+    st.write(f"**信頼度の根拠**: 類似成約 n={int(v['similar_count'])}、信頼度 {v['confidence']}")
+    if flags:
+        st.write("**リスクフラグ**")
+        for f in flags:
+            icon = "⛔" if f["severity"] == "hard" else "⚠️"
+            st.write(f"- {icon} {f['label']}: {f['detail']}")
     else:
-        st.info("まだモデルが学習されていません")
+        st.write("リスクフラグ: なし（一次資料での確認は依然として必要です）")
 
+    inv = analyze_investment(
+        int(p["price"]),
+        int(p["monthly_rent"]) if pd.notna(p.get("monthly_rent")) else None,
+        int(p["management_fee"]) if pd.notna(p.get("management_fee")) else None,
+        int(p["repair_reserve_fund"]) if pd.notna(p.get("repair_reserve_fund")) else None,
+    )
+    st.write("**投資指標**（割安スコアとは別軸の情報です）")
+    if inv:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("表面利回り", f"{inv['gross_yield']:.2%}")
+        c2.metric("NOI（年間）", format_yen(inv["noi"]))
+        c3.metric("NOI利回り", f"{inv['noi_yield']:.2%}")
+        st.caption("試算の仮定: " + "、".join(f"{k}={val}" for k, val in inv["assumptions"].items()))
+    else:
+        st.write("賃料が未入力のため、利回りは表示しません（推定利回りは出しません）。")
 
-def show_statistics():
-    """統計情報を表示"""
-    st.header("📊 統計情報")
-
-    with DatabaseManager() as db:
-        stats = db.get_statistics()
-
-        # 基本統計
-        st.subheader("📈 基本統計")
-        stat_col1, stat_col2, stat_col3 = st.columns(3)
-
-        with stat_col1:
-            st.metric("物件総数", f"{stats['total_properties']:,} 件")
-
-        with stat_col2:
-            st.metric("予測総数", f"{stats['total_predictions']:,} 件")
-
-        with stat_col3:
-            st.metric("平均価格", format_price(stats['avg_price']))
-
-        # 都道府県別件数
-        st.subheader("🗾 都道府県別件数")
-        if stats["prefecture_counts"]:
-            pref_df = pd.DataFrame(
-                list(stats["prefecture_counts"].items()),
-                columns=["都道府県", "件数"],
-            )
-            st.bar_chart(pref_df.set_index("都道府県"))
-        else:
-            st.info("データがありません")
-
-        # サイト別件数
-        st.subheader("🌐 サイト別件数")
-        if stats["site_counts"]:
-            site_df = pd.DataFrame(
-                list(stats["site_counts"].items()),
-                columns=["サイト", "件数"],
-            )
-            st.bar_chart(site_df.set_index("サイト"))
-        else:
-            st.info("データがありません")
-
-        # 物件データ取得
-        if stats["total_properties"] > 0:
-            df = db.get_properties(limit=10000)
-
-            # 価格分布
-            st.subheader("💰 価格分布")
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.hist(df["price"] / 10000, bins=50, edgecolor="black")
-            ax.set_xlabel("Price (万円)")
-            ax.set_ylabel("Frequency")
-            ax.set_title("Price Distribution")
-            st.pyplot(fig)
-
-            # 築年数分布
-            st.subheader("🏗️ 築年数分布")
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.hist(df["building_age"].dropna(), bins=40, edgecolor="black")
-            ax.set_xlabel("Building Age (years)")
-            ax.set_ylabel("Frequency")
-            ax.set_title("Building Age Distribution")
-            st.pyplot(fig)
+    valuation = Valuation(
+        property_id=str(p["property_id"]),
+        listing_price=int(p["price"]),
+        theoretical_price=float(v["theoretical_price"]) if pd.notna(v["theoretical_price"]) else None,
+        conservative_price=float(v["conservative_price"]) if pd.notna(v["conservative_price"]) else None,
+        interval_low=float(v["interval_low"]) if pd.notna(v["interval_low"]) else None,
+        interval_high=float(v["interval_high"]) if pd.notna(v["interval_high"]) else None,
+        score=float(v["score"]) if pd.notna(v["score"]) else None,
+        similar_count=int(v["similar_count"]),
+        has_recent=True,
+        pool_level="-",
+        model_used=True,
+        gate_passed=bool(v["gate_passed"]),
+        flags=[RiskFlag(**f) for f in flags],
+        confidence=str(v["confidence"]),
+    )
+    prop_dict = {
+        k: (None if isinstance(val, float) and pd.isna(val) else val)
+        for k, val in p.items()
+    }
+    checklist_md = build_checklist_markdown(prop_dict, valuation)
+    st.download_button(
+        "📋 精査チェックリスト（Markdown）をダウンロード",
+        data=checklist_md.encode("utf-8"),
+        file_name=f"checklist_{p['property_id']}.md",
+        mime="text/markdown",
+        key=f"dl_{p['property_id']}",
+    )
 
 
 if __name__ == "__main__":

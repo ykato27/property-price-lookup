@@ -18,6 +18,25 @@ DB_PATH = DATA_DIR / "properties.db"
 LATEST_MODEL_PATH = MODEL_DIR / "latest_model.pkl"
 MODEL_METADATA_PATH = MODEL_DIR / "model_metadata.json"
 
+# 理論価格モデル（成約データベース）のパス
+PRICE_MODEL_PATH = MODEL_DIR / "price_model.pkl"
+PRICE_MODEL_METADATA_PATH = MODEL_DIR / "price_model_metadata.json"
+
+# API等から取得した生データの保存先
+RAW_DATA_DIR = DATA_DIR / "raw"
+
+# 国土交通省「不動産情報ライブラリ」API（XIT001）設定
+# 利用には申請・審査・APIキー発行が必要。キーは環境変数 REINFOLIB_API_KEY で渡す。
+# 申請手順は docs/DATA_SOURCES.md を参照。
+REINFOLIB_API_BASE_URL = "https://www.reinfolib.mlit.go.jp/ex-api/external"
+REINFOLIB_API_KEY_ENV = "REINFOLIB_API_KEY"
+
+
+def get_reinfolib_api_key() -> str | None:
+    """環境変数から不動産情報ライブラリのAPIキーを取得する（未設定なら None）。"""
+    key = os.environ.get(REINFOLIB_API_KEY_ENV, "").strip()
+    return key or None
+
 # スクレイピング設定
 SCRAPING_SETTINGS = {
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -50,3 +69,4 @@ DATA_RETENTION_DAYS = 365
 # ディレクトリ作成
 DATA_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
+RAW_DATA_DIR.mkdir(exist_ok=True)

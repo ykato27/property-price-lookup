@@ -8,7 +8,12 @@ from typing import List, Dict, Optional, Any
 import pandas as pd
 
 from config.settings import DB_PATH, DATA_RETENTION_DAYS
-from src.database.schema import ALL_TABLES, CREATE_INDEXES
+from src.database.schema import (
+    ALL_TABLES,
+    CREATE_INDEXES,
+    PREDICTION_ADDITIONAL_COLUMNS,
+    PROPERTY_ADDITIONAL_COLUMNS,
+)
 
 
 class DatabaseManager:
@@ -45,7 +50,7 @@ class DatabaseManager:
             self.conn = None
 
     def initialize_database(self):
-        """データベースを初期化（テーブル作成）"""
+        """データベースを初期化（テーブル作成＋既存DBへのカラム追加）"""
         cursor = self.conn.cursor()
 
         # テーブル作成
@@ -56,7 +61,21 @@ class DatabaseManager:
         for index_sql in CREATE_INDEXES:
             cursor.execute(index_sql)
 
+        # 既存DBへの追加カラム（冪等なマイグレーション）
+        self._add_missing_columns(cursor, "properties", PROPERTY_ADDITIONAL_COLUMNS)
+        self._add_missing_columns(cursor, "predictions", PREDICTION_ADDITIONAL_COLUMNS)
+
         self.conn.commit()
+
+    @staticmethod
+    def _add_missing_columns(cursor, table: str, columns: Dict[str, str]):
+        """テーブルに不足しているカラムを追加する（既にあれば何もしない）。"""
+        existing = {
+            row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, ddl in columns.items():
+            if name not in existing:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     # ========== Properties テーブル操作 ==========
 
@@ -172,6 +191,9 @@ class DatabaseManager:
         """
         予測データを挿入
 
+        同一物件の過去の予測は「最新のみ有効」の運用として is_latest=0 にし、
+        再予測しても割安一覧が重複しないようにする。
+
         Args:
             prediction_data: 予測データ辞書
 
@@ -180,10 +202,17 @@ class DatabaseManager:
         """
         try:
             cursor = self.conn.cursor()
-            columns = ", ".join(prediction_data.keys())
-            placeholders = ", ".join(["?" for _ in prediction_data])
+            if "property_id" in prediction_data:
+                cursor.execute(
+                    "UPDATE predictions SET is_latest = 0 WHERE property_id = ?",
+                    (prediction_data["property_id"],),
+                )
+            data = dict(prediction_data)
+            data.setdefault("is_latest", 1)
+            columns = ", ".join(data.keys())
+            placeholders = ", ".join(["?" for _ in data])
             sql = f"INSERT INTO predictions ({columns}) VALUES ({placeholders})"
-            cursor.execute(sql, list(prediction_data.values()))
+            cursor.execute(sql, list(data.values()))
             self.conn.commit()
             return True
         except Exception as e:
@@ -229,10 +258,104 @@ class DatabaseManager:
         FROM properties p
         INNER JOIN predictions pr ON p.property_id = pr.property_id
         WHERE pr.discount_rate >= ?
+          AND COALESCE(pr.is_latest, 1) = 1
         ORDER BY pr.discount_rate DESC
         LIMIT ?
         """
         return pd.read_sql_query(sql, self.conn, params=[min_discount_rate, limit])
+
+    def get_latest_valuations(self, gate_only: bool = False) -> pd.DataFrame:
+        """
+        最新の評価（理論価格・割安スコア・ゲート・フラグ）付き物件一覧を取得
+
+        Args:
+            gate_only: True ならゲート通過（割安候補）のみ
+
+        Returns:
+            物件＋最新評価のDataFrame
+        """
+        sql = """
+        SELECT
+            p.*,
+            pr.predicted_price,
+            pr.theoretical_price,
+            pr.conservative_price,
+            pr.interval_low,
+            pr.interval_high,
+            pr.discount_rate,
+            pr.score,
+            pr.similar_count,
+            pr.confidence,
+            pr.risk_flags,
+            pr.gate_passed,
+            pr.predicted_at
+        FROM properties p
+        INNER JOIN predictions pr ON p.property_id = pr.property_id
+        WHERE COALESCE(pr.is_latest, 1) = 1
+        """
+        if gate_only:
+            sql += " AND pr.gate_passed = 1"
+        sql += " ORDER BY pr.score DESC"
+        return pd.read_sql_query(sql, self.conn)
+
+    # ========== Transactions テーブル操作 ==========
+
+    def bulk_insert_transactions(self, records: List[Dict[str, Any]]) -> int:
+        """
+        成約事例を一括挿入（record_hash で重複を除く）
+
+        Args:
+            records: 正規化済み成約レコードのリスト
+
+        Returns:
+            実際に挿入された件数
+        """
+        if not records:
+            return 0
+        cursor = self.conn.cursor()
+        columns = list(records[0].keys())
+        placeholders = ", ".join(["?" for _ in columns])
+        sql = (
+            f"INSERT OR IGNORE INTO transactions ({', '.join(columns)}) "
+            f"VALUES ({placeholders})"
+        )
+        before = cursor.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        cursor.executemany(sql, [tuple(r[c] for c in columns) for r in records])
+        self.conn.commit()
+        after = cursor.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        return after - before
+
+    def get_transactions(
+        self,
+        prefecture: Optional[str] = None,
+        municipality_code: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        成約事例を取得
+
+        Returns:
+            成約事例のDataFrame
+        """
+        sql = "SELECT * FROM transactions WHERE 1=1"
+        params: List[Any] = []
+        if prefecture:
+            sql += " AND prefecture = ?"
+            params.append(prefecture)
+        if municipality_code:
+            sql += " AND municipality_code = ?"
+            params.append(municipality_code)
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
+        sql += " ORDER BY period_year, period_quarter"
+        return pd.read_sql_query(sql, self.conn, params=params)
+
+    def get_transaction_count(self) -> int:
+        """成約事例の総件数を取得"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM transactions")
+        return cursor.fetchone()[0]
 
     # ========== Scraping Logs テーブル操作 ==========
 
