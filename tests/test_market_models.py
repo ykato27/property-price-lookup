@@ -121,6 +121,46 @@ def test_price_model_save_load_roundtrip(transactions_df, tmp_path):
     assert np.allclose(a, b)
 
 
+def test_price_model_uses_extended_features_and_calibration(transactions_df, tmp_path):
+    """本実験で採用した構成（te_extra + 較正）が本番モデルに反映されていること。"""
+    model = PriceModel().fit(transactions_df)
+    # TE（地区名・駅名）が学習され、状態が保存・復元できる
+    assert set(model.te_encoders) == {"district_name", "nearest_station"}
+    assert model.te_encoders["district_name"].mapping
+    assert model.calibration_delta >= 0.0
+    assert model.feature_version == 2
+    model_path = tmp_path / "pm.pkl"
+    model.save(model_path=model_path, metadata_path=tmp_path / "pm.json")
+    loaded = PriceModel.load(model_path)
+    assert loaded.calibration_delta == model.calibration_delta
+    assert loaded.te_encoders["district_name"].mapping == \
+        model.te_encoders["district_name"].mapping
+
+    # listing 行のように拡張列が無い入力でも予測できる（欠損として扱う）
+    listing_like = pd.DataFrame(
+        [
+            {
+                "prefecture": "東京都",
+                "municipality": "港区",
+                "district_name": None,
+                "structure": "ＲＣ",
+                "city_planning": None,
+                "region": None,
+                "floor_plan": "２ＬＤＫ",
+                "area": 65.0,
+                "building_year": 2010,
+                "period_year": 2026,
+                "period_quarter": 1,
+                "station_distance_min": 8.0,
+            }
+        ]
+    )
+    preds = model.predict_unit_quantiles(listing_like)
+    assert preds.shape == (1, 3)
+    assert np.isfinite(preds).all()
+    assert preds[0, 0] <= preds[0, 1] <= preds[0, 2]
+
+
 def test_price_model_handles_nan_in_categoricals():
     """実データ回帰: カテゴリ列に欠損（NaN）が文字列と混在しても fit/predict が落ちないこと。
 

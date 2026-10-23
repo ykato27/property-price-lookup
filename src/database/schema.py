@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     unit_price REAL,
     building_year INTEGER,
     structure TEXT,
+    use TEXT,
+    purpose TEXT,
+    coverage_ratio REAL,
+    floor_area_ratio REAL,
     city_planning TEXT,
     renovation TEXT,
     remarks TEXT,
@@ -121,6 +125,15 @@ PROPERTY_ADDITIONAL_COLUMNS = {
     "monthly_rent": "INTEGER",
     "total_units": "INTEGER",
     "listing_date": "TEXT",
+}
+
+# transactions: 精度実験の特徴量（用途・建ぺい率・容積率）用に追加したカラム。
+# 旧取り込みでは正規化で落としていた項目で、既存DBには NULL で追加される。
+TRANSACTION_ADDITIONAL_COLUMNS = {
+    "use": "TEXT",
+    "purpose": "TEXT",
+    "coverage_ratio": "REAL",
+    "floor_area_ratio": "REAL",
 }
 
 # predictions: 「最新予測のみ有効」の運用と、新しい評価（理論価格・区間・ゲート等）。

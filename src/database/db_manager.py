@@ -13,6 +13,7 @@ from src.database.schema import (
     CREATE_INDEXES,
     PREDICTION_ADDITIONAL_COLUMNS,
     PROPERTY_ADDITIONAL_COLUMNS,
+    TRANSACTION_ADDITIONAL_COLUMNS,
 )
 
 
@@ -64,6 +65,7 @@ class DatabaseManager:
         # 既存DBへの追加カラム（冪等なマイグレーション）
         self._add_missing_columns(cursor, "properties", PROPERTY_ADDITIONAL_COLUMNS)
         self._add_missing_columns(cursor, "predictions", PREDICTION_ADDITIONAL_COLUMNS)
+        self._add_missing_columns(cursor, "transactions", TRANSACTION_ADDITIONAL_COLUMNS)
 
         self.conn.commit()
 
