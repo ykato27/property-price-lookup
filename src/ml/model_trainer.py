@@ -42,31 +42,33 @@ class ModelTrainer:
         """
         print(f"学習データ件数: {len(df)}")
 
-        # 外れ値除去
-        if remove_outliers_flag:
-            original_count = len(df)
-            df = remove_outliers(df, "price", n_std=3.0)
-            print(f"外れ値除去: {original_count} -> {len(df)} 件")
-
-        # 特徴量準備
-        X, y = self.feature_engineer.prepare_training_data(df)
-
-        print(f"特徴量数: {X.shape[1]}")
-        print(f"有効データ件数: {len(X)}")
-
-        # 最小データ数チェック
-        if len(X) < ML_SETTINGS["min_data_count"]:
-            raise ValueError(
-                f"データ数が不足しています。最低{ML_SETTINGS['min_data_count']}件必要です。"
-            )
-
-        # 訓練・検証データ分割
-        X_train, X_val, y_train, y_val = train_test_split(
-            X,
-            y,
+        # 訓練・検証データ分割を先に行う。
+        # 分割より前にエンコーダーのfitや外れ値除去（平均・標準偏差の計算）を
+        # すると検証データの情報が学習に混入する（学習リーク）ため。
+        df_train_raw, df_val_raw = train_test_split(
+            df,
             test_size=ML_SETTINGS["test_size"],
             random_state=ML_SETTINGS["random_state"],
         )
+
+        # 外れ値除去（訓練データのみに適用）
+        if remove_outliers_flag:
+            original_count = len(df_train_raw)
+            df_train_raw = remove_outliers(df_train_raw, "price", n_std=3.0)
+            print(f"外れ値除去: {original_count} -> {len(df_train_raw)} 件")
+
+        # 特徴量準備: fitは訓練データのみ、検証データはtransformのみ
+        X_train, y_train = self.feature_engineer.prepare_training_data(df_train_raw)
+        X_val, y_val = self.feature_engineer.prepare_validation_data(df_val_raw)
+
+        print(f"特徴量数: {X_train.shape[1]}")
+        print(f"有効データ件数: {len(X_train) + len(X_val)}")
+
+        # 最小データ数チェック
+        if len(X_train) < ML_SETTINGS["min_data_count"]:
+            raise ValueError(
+                f"データ数が不足しています。最低{ML_SETTINGS['min_data_count']}件必要です。"
+            )
 
         print(f"訓練データ: {len(X_train)} 件")
         print(f"検証データ: {len(X_val)} 件")
@@ -81,7 +83,7 @@ class ModelTrainer:
         # 特徴量重要度
         self.feature_importance = pd.DataFrame(
             {
-                "feature": X.columns,
+                "feature": X_train.columns,
                 "importance": self.model.feature_importances_,
             }
         ).sort_values("importance", ascending=False)

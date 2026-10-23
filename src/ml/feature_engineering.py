@@ -1,10 +1,49 @@
 """
 特徴量エンジニアリング
+
+fit/transform を分離している。fit は訓練データにのみ適用し、
+検証・予測データには transform のみを使う（学習リーク防止）。
+未見のカテゴリは専用値 -1 にマッピングし、バッチ全体を失敗させない。
 """
 import pandas as pd
 import numpy as np
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 from sklearn.preprocessing import LabelEncoder
+
+# 欠損値を中央値で埋める数値カラム
+_NUMERIC_COLUMNS = [
+    "building_age",
+    "floor_area",
+    "floor_number",
+    "total_floors",
+    "station_distance",
+    "management_fee",
+    "repair_reserve_fund",
+]
+
+# 欠損値を "不明" で埋めるカテゴリカラム
+_CATEGORICAL_FILLNA_COLUMNS = [
+    "prefecture",
+    "city",
+    "layout",
+    "structure",
+    "direction",
+]
+
+# ラベルエンコーディング対象のカラム
+_LABEL_ENCODE_COLUMNS = [
+    "prefecture",
+    "city",
+    "layout",
+    "structure",
+    "direction",
+    "station_distance_category",
+    "age_category",
+    "area_category",
+]
+
+# 未見カテゴリに割り当てる専用値
+UNKNOWN_CATEGORY_VALUE = -1
 
 
 class FeatureEngineer:
@@ -12,67 +51,88 @@ class FeatureEngineer:
 
     def __init__(self):
         """初期化"""
-        self.label_encoders = {}
+        self.label_encoders: Dict[str, LabelEncoder] = {}
+        self.numeric_medians: Dict[str, float] = {}
 
-    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def fit(self, df: pd.DataFrame) -> "FeatureEngineer":
         """
-        特徴量を生成
+        訓練データのみで変換に必要な統計量を学習する。
+
+        検証・予測データには fit を適用してはならない（学習リークになる）。
+        そちらには transform_features / prepare_validation_data を使う。
 
         Args:
-            df: 元のDataFrame
+            df: 訓練データのDataFrame
+
+        Returns:
+            self
+        """
+        df = df.copy()
+        self.numeric_medians = {
+            col: df[col].median()
+            for col in _NUMERIC_COLUMNS
+            if col in df.columns
+        }
+        df = self._fill_missing(df)
+        df = self._create_derived_features(df)
+        for col in _LABEL_ENCODE_COLUMNS:
+            if col in df.columns:
+                encoder = LabelEncoder()
+                encoder.fit(df[col].astype(str))
+                self.label_encoders[col] = encoder
+        return self
+
+    def transform_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        学習済みの変換のみを適用する（fit はしない）。
+
+        未見のカテゴリは専用値 -1 にマッピングされるため、
+        予測バッチ全体が ValueError で失敗することはない。
+
+        Args:
+            df: 変換対象のDataFrame
 
         Returns:
             特徴量追加後のDataFrame
         """
         df = df.copy()
-
-        # 基本特徴量のクリーニング
-        df = self._clean_basic_features(df)
-
-        # 派生特徴量の生成
+        df = self._fill_missing(df)
         df = self._create_derived_features(df)
-
-        # カテゴリ特徴量のエンコーディング
-        df = self._encode_categorical_features(df)
-
+        for col in _LABEL_ENCODE_COLUMNS:
+            if col in df.columns and col in self.label_encoders:
+                encoder = self.label_encoders[col]
+                values = df[col].astype(str)
+                known_mask = values.isin(set(encoder.classes_))
+                encoded = pd.Series(
+                    UNKNOWN_CATEGORY_VALUE, index=df.index, dtype="int64"
+                )
+                if known_mask.any():
+                    encoded.loc[known_mask] = encoder.transform(values[known_mask])
+                df[f"{col}_encoded"] = encoded
         return df
 
-    def _clean_basic_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        基本特徴量のクリーニング
+        特徴量を生成（後方互換のための fit + transform）。
 
-        Args:
-            df: DataFrame
-
-        Returns:
-            クリーニング済みDataFrame
+        新規コードでは fit / transform_features / prepare_*_data を使うこと。
         """
-        # 欠損値の処理
-        numeric_columns = [
-            "building_age",
-            "floor_area",
-            "floor_number",
-            "total_floors",
-            "station_distance",
-            "management_fee",
-            "repair_reserve_fund",
-        ]
+        self.fit(df)
+        return self.transform_features(df)
 
-        for col in numeric_columns:
+    def _fill_missing(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        欠損値を補完する。数値は fit 時に学習した中央値を使う。
+
+        fit 前（numeric_medians が空）の場合のみ対象データの中央値を使う。
+        """
+        medians = getattr(self, "numeric_medians", {})
+        for col in _NUMERIC_COLUMNS:
             if col in df.columns:
-                # 中央値で埋める
-                df[col] = df[col].fillna(df[col].median())
+                median = medians.get(col, df[col].median())
+                df[col] = df[col].fillna(median)
 
-        # カテゴリ変数の欠損値
-        categorical_columns = [
-            "prefecture",
-            "city",
-            "layout",
-            "structure",
-            "direction",
-        ]
-
-        for col in categorical_columns:
+        for col in _CATEGORICAL_FILLNA_COLUMNS:
             if col in df.columns:
                 df[col] = df[col].fillna("不明")
 
@@ -130,43 +190,6 @@ class FeatureEngineer:
 
         return df
 
-    def _encode_categorical_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        カテゴリ特徴量のエンコーディング
-
-        Args:
-            df: DataFrame
-
-        Returns:
-            エンコーディング済みDataFrame
-        """
-        # ラベルエンコーディング対象のカラム
-        label_encode_cols = [
-            "prefecture",
-            "city",
-            "layout",
-            "structure",
-            "direction",
-            "station_distance_category",
-            "age_category",
-            "area_category",
-        ]
-
-        for col in label_encode_cols:
-            if col in df.columns:
-                if col not in self.label_encoders:
-                    self.label_encoders[col] = LabelEncoder()
-                    df[f"{col}_encoded"] = self.label_encoders[col].fit_transform(
-                        df[col].astype(str)
-                    )
-                else:
-                    # 学習済みエンコーダーを使用
-                    df[f"{col}_encoded"] = self.label_encoders[col].transform(
-                        df[col].astype(str)
-                    )
-
-        return df
-
     @staticmethod
     def _extract_room_count(layout: str) -> int:
         """
@@ -220,36 +243,58 @@ class FeatureEngineer:
             "area_category_encoded",
         ]
 
-    def prepare_training_data(
-        self, df: pd.DataFrame
-    ) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        学習用データを準備
-
-        Args:
-            df: 物件データのDataFrame
-
-        Returns:
-            (特徴量DataFrame, ターゲットSeries)
-        """
-        # 特徴量生成
-        df = self.create_features(df)
-
-        # 学習用カラムを取得
+    def _select_xy(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+        """特徴量カラムとターゲットを切り出し、欠損行を除去する。"""
         feature_cols = self.get_feature_columns()
-
-        # 存在するカラムのみ使用
         available_cols = [col for col in feature_cols if col in df.columns]
 
         X = df[available_cols]
         y = df["price"]
 
-        # 欠損値を含む行を削除
         valid_idx = ~(X.isnull().any(axis=1) | y.isnull())
         X = X[valid_idx]
         y = y[valid_idx]
 
         return X, y
+
+    def prepare_training_data(
+        self, df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, pd.Series]:
+        """
+        学習用データを準備（fit + transform）。
+
+        訓練分割にのみ使うこと。検証データには prepare_validation_data を使う。
+
+        Args:
+            df: 物件データのDataFrame（訓練分割）
+
+        Returns:
+            (特徴量DataFrame, ターゲットSeries)
+        """
+        self.fit(df)
+        return self._select_xy(self.transform_features(df))
+
+    def prepare_validation_data(
+        self, df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, pd.Series]:
+        """
+        検証・評価用データを準備（transform のみ）。
+
+        事前に prepare_training_data() か fit() を呼んでおくこと。
+        未見カテゴリは -1 になる。
+
+        Args:
+            df: 物件データのDataFrame（検証分割など）
+
+        Returns:
+            (特徴量DataFrame, ターゲットSeries)
+        """
+        if not self.label_encoders:
+            raise ValueError(
+                "エンコーダーが学習されていません。"
+                "先に prepare_training_data() か fit() を呼んでください。"
+            )
+        return self._select_xy(self.transform_features(df))
 
 
 def remove_outliers(df: pd.DataFrame, column: str, n_std: float = 3.0) -> pd.DataFrame:

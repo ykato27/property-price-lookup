@@ -47,9 +47,9 @@ class PricePredictor:
         if self.model is None:
             self.load_model()
 
-        # 特徴量準備
+        # 特徴量準備（学習済み変換のみ。未見カテゴリは -1 になる）
         df = properties_df.copy()
-        df = self.feature_engineer.create_features(df)
+        df = self.feature_engineer.transform_features(df)
 
         # 学習時と同じ特徴量カラムを使用
         feature_cols = self.feature_engineer.get_feature_columns()
