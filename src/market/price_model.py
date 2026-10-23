@@ -91,7 +91,13 @@ def build_features(df: pd.DataFrame, encoders: Optional[Dict[str, Dict[str, int]
 
     encoders = encoders if encoders is not None else {}
     for col in _CATEGORICAL_FEATURES:
-        values = df[col].astype(str) if col in df else pd.Series("nan", index=df.index)
+        if col in df:
+            raw = df[col]
+            # 欠損（NaN/NA）を含む実データでも壊れないよう、欠損は専用カテゴリに寄せてから文字列化する
+            # （pandas 3 では astype(str) が欠損を文字列化しないため、混在型のままソートすると落ちる）
+            values = raw.astype(object).where(raw.notna(), "__missing__").astype(str)
+        else:
+            values = pd.Series("__missing__", index=df.index)
         if fit_encoders:
             mapping = {v: i for i, v in enumerate(sorted(values.unique()))}
             encoders[col] = mapping

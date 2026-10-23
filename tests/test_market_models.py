@@ -119,3 +119,32 @@ def test_price_model_save_load_roundtrip(transactions_df, tmp_path):
     a = model.predict_unit_quantiles(rows)
     b = loaded.predict_unit_quantiles(rows)
     assert np.allclose(a, b)
+
+
+def test_price_model_handles_nan_in_categoricals():
+    """実データ回帰: カテゴリ列に欠損（NaN）が文字列と混在しても fit/predict が落ちないこと。
+
+    不動産情報ライブラリの実CSVでは間取り・構造等が欠損する行があり、
+    pandas 3 の astype(str) は欠損を文字列化しないため、欠損を専用カテゴリに
+    寄せる処理が無いとエンコーダ学習時のソートで TypeError になっていた。
+    """
+    rng = np.random.default_rng(0)
+    n = 240
+    df = pd.DataFrame({
+        "trade_price": rng.integers(2000, 9000, n) * 10000,
+        "area": rng.integers(40, 100, n).astype(float),
+        "building_year": rng.integers(1990, 2020, n),
+        "period_year": [2025] * n,
+        "period_quarter": rng.integers(1, 5, n),
+        "station_distance_min": rng.integers(1, 15, n).astype(float),
+        "floor_plan": ["３ＬＤＫ", None, "２ＬＤＫ", np.nan] * (n // 4),
+        "structure": ["ＲＣ", np.nan, "ＳＲＣ", "ＲＣ"] * (n // 4),
+        "municipality": ["港区"] * n,
+        "prefecture": ["東京都"] * n,
+        "district_name": ["赤坂", None, "白金", "麻布"] * (n // 4),
+        "city_planning": ["商業", np.nan, "１中住専", "商業"] * (n // 4),
+        "renovation": ["未改装", "改装済み", None, "未改装"] * (n // 4),
+    })
+    model = PriceModel().fit(df)
+    preds = model.predict_unit_quantiles(df.head(5))
+    assert preds.shape == (5, 3)
