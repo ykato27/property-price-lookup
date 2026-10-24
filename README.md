@@ -31,6 +31,8 @@ listing はポータルサイトのスクレイピングではなく、CSV 投�
 取り込みます（取得日・出所が必須）。設計判断の詳細は [docs/DESIGN.md](docs/DESIGN.md)、
 データソースと API キー申請手順は [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md)、
 評価結果は [docs/EVALUATION.md](docs/EVALUATION.md) を参照してください。
+学習・評価に使った実データ（取引価格情報 269,202 件・2021Q1〜2026Q1）は
+都道府県別 CSV として [data/transactions/](data/transactions/) に公開しています。
 
 ## セットアップ
 
